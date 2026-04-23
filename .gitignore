@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Xcode — user-specific state (personal, not shared)
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Xcode — build output
+build/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Swift Package Manager
+.build/
+.swiftpm/
+# NOTE: Package.resolved is intentionally tracked — it locks dependency versions for apps.
+
+# Claude Code — personal local overrides (project-shared settings.json should be committed)
+.claude/settings.local.json
+
+# Playgrounds leftovers
+timeline.xctimeline
+playground.xcworkspace
