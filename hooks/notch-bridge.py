@@ -1,60 +1,68 @@
 #!/usr/bin/env python3
 """
-Phase 2.1 bridge hook for ClaudeNotch.
+Phase 2.2 bridge hook for ClaudeNotch.
 
-For every PreToolUse event:
-1. Append the raw payload to LOG_PATH (debug trail).
-2. Best-effort forward it to the Swift app over a Unix domain socket at
-   SOCKET_PATH. If the app is not running / the socket is missing, the
-   forward silently fails after SOCKET_TIMEOUT_SEC and Claude Code is
-   unaffected.
-3. Return an empty JSON object so Claude's default permission flow runs.
+Forwards each PreToolUse event to the Swift app over /tmp/claude-notch.sock
+and blocks until Swift sends back the JSON that Claude Code should see as
+this hook's stdout. Swift is the source of truth for the decision; this
+script is essentially a dumb pipe with a safety fallback.
 
-Phase 2.2 will replace step 2 with a request/response exchange — the hook
-will wait for the user's decision from the notch and echo it back to Claude
-as `permissionDecision`.
+Behavior:
+- Swift app not running → silently write {} (no override → Claude's default flow).
+- Connect fast (0.2s); read up to RESPONSE_TIMEOUT_SEC for the decision.
+- If read times out → write {} (safe fallback; Claude still uses default flow).
+- Any Swift response (incl. {}) is piped verbatim to stdout.
 """
 
 from __future__ import annotations
 
-import json
 import socket
 import sys
 from datetime import datetime
 
 LOG_PATH = "/tmp/claude-notch-test.log"
 SOCKET_PATH = "/tmp/claude-notch.sock"
-SOCKET_TIMEOUT_SEC = 0.2
+CONNECT_TIMEOUT_SEC = 0.2
+RESPONSE_TIMEOUT_SEC = 35  # slightly longer than Swift's 30s pending timeout
 
 
-def forward_to_notch(payload: str) -> str:
-    """Send payload and block briefly until the server closes its end.
-
-    Why the read after shutdown: NWListener on macOS appears to silently drop
-    connections whose client closes before the framework has pulled the new
-    socket off the accept queue. Blocking here (bounded by SOCKET_TIMEOUT_SEC)
-    keeps the client alive long enough for Swift to accept, read, and cancel
-    the connection — at which point our recv() returns 0 bytes (EOF).
-    """
+def forward_to_notch(payload: str) -> tuple[str, bytes]:
+    """Send payload, wait for Swift's response. Returns (status, bytes)."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(SOCKET_TIMEOUT_SEC)
     try:
-        sock.connect(SOCKET_PATH)
-        sock.sendall(payload.encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
+        sock.settimeout(CONNECT_TIMEOUT_SEC)
         try:
-            sock.recv(1)  # blocks until server closes or timeout
+            sock.connect(SOCKET_PATH)
+        except FileNotFoundError:
+            return "no-socket", b""
+        except ConnectionRefusedError:
+            return "refused", b""
         except socket.timeout:
-            pass  # server was slow, but bytes were delivered
-        return "sent"
-    except FileNotFoundError:
-        return "no-socket"
-    except ConnectionRefusedError:
-        return "refused"
-    except socket.timeout:
-        return "timeout"
-    except OSError as error:
-        return f"oserror:{error.errno}"
+            return "connect-timeout", b""
+        except OSError as error:
+            return f"oserror-connect:{error.errno}", b""
+
+        try:
+            sock.sendall(payload.encode("utf-8"))
+            sock.shutdown(socket.SHUT_WR)
+        except OSError as error:
+            return f"oserror-send:{error.errno}", b""
+
+        # Wait for Swift's decision.
+        sock.settimeout(RESPONSE_TIMEOUT_SEC)
+        buffer = bytearray()
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+        except socket.timeout:
+            return "recv-timeout", bytes(buffer)
+        except OSError as error:
+            return f"oserror-recv:{error.errno}", bytes(buffer)
+
+        return "ok", bytes(buffer)
     finally:
         sock.close()
 
@@ -62,12 +70,19 @@ def forward_to_notch(payload: str) -> str:
 def main() -> int:
     raw_payload = sys.stdin.read()
     timestamp = datetime.now().isoformat(timespec="seconds")
-    status = forward_to_notch(raw_payload) if raw_payload else "empty-input"
 
+    if raw_payload:
+        status, response_bytes = forward_to_notch(raw_payload)
+    else:
+        status, response_bytes = "empty-input", b""
+
+    response_str = response_bytes.decode("utf-8", "replace")
+    preview = response_str if len(response_str) <= 200 else response_str[:200] + "..."
     with open(LOG_PATH, "a", encoding="utf-8") as log:
-        log.write(f"[{timestamp}] bridge={status} {raw_payload}\n")
+        log.write(f"[{timestamp}] bridge={status} resp={preview} {raw_payload}\n")
 
-    sys.stdout.write(json.dumps({}))
+    # Pipe Swift's response verbatim, or fall back to empty {} if nothing came.
+    sys.stdout.write(response_str if response_bytes else "{}")
     return 0
 
 

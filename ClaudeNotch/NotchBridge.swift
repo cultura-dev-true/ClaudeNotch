@@ -5,8 +5,6 @@ import Observation
 // MARK: - HookEvent
 
 /// Minimal projection of a Claude Code PreToolUse hook payload.
-/// Only the fields the notch actually needs are extracted; the rest is ignored
-/// so new/unknown fields from Claude Code won't break the pipeline.
 struct HookEvent: Equatable {
     let toolName: String
     let summary: String?
@@ -32,55 +30,168 @@ struct HookEvent: Equatable {
     }
 }
 
+// MARK: - ResponseDecision
+
+/// The JSON this hook should write to stdout for Claude Code to read.
+/// `.ask` means "empty {} — no override, use default permission flow".
+enum ResponseDecision {
+    case allow
+    case deny(reason: String)
+    case ask
+
+    var hookOutputJSON: Data {
+        let dict: [String: Any]
+        switch self {
+        case .allow:
+            dict = ["hookSpecificOutput": [
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            ]]
+        case .deny(let reason):
+            dict = ["hookSpecificOutput": [
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            ]]
+        case .ask:
+            dict = [:]
+        }
+        return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
+    }
+}
+
+// MARK: - IncomingRequest
+
+/// One hook invocation that's waiting on our side for a decision.
+/// `respond` sends the decision back over the socket and closes it.
+struct IncomingRequest: Identifiable {
+    let id = UUID()
+    let event: HookEvent
+    let respond: (ResponseDecision) -> Void
+}
+
 // MARK: - NotchState
 
-/// UI state for the notch. `current` is set when a hook event arrives and
-/// automatically cleared after `autoClearDelay` seconds.
-///
-/// `@Observable` (Swift 5.9+) means any SwiftUI view that reads a property
-/// off this class gets invalidated when the property changes — no need for
-/// @Published / ObservableObject / @ObservedObject.
 @MainActor
 @Observable
 final class NotchState {
-    var current: HookEvent?
 
-    private let autoClearDelay: Duration = .seconds(3)
-    private var clearTask: Task<Void, Never>?
+    enum Display: Equatable {
+        case idle
+        case observing(HookEvent)       // auto-clears after autoClearDelay
+        case pending(IncomingRequest)   // blocks until user click or timeout
 
-    func show(_ event: HookEvent) {
-        current = event
-        clearTask?.cancel()
-        clearTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: autoClearDelay)
-            if !Task.isCancelled {
-                self.current = nil
+        static func == (lhs: Display, rhs: Display) -> Bool {
+            switch (lhs, rhs) {
+            case (.idle, .idle): return true
+            case let (.observing(a), .observing(b)): return a == b
+            case let (.pending(a), .pending(b)): return a.id == b.id
+            default: return false
             }
         }
+    }
+
+    var display: Display = .idle
+
+    /// Called whenever `display` changes — AppDelegate uses this to resize the NSPanel.
+    var onDisplayChanged: ((Display) -> Void)?
+
+    private var queue: [IncomingRequest] = []
+    private var autoClearTask: Task<Void, Never>?
+    private var pendingTimeoutTask: Task<Void, Never>?
+
+    private let autoClearDelay: Duration = .seconds(3)
+    private let pendingTimeoutDelay: Duration = .seconds(30)
+
+    // MARK: Input from SocketServer
+
+    func handle(_ request: IncomingRequest) {
+        if shouldPrompt(request.event) {
+            if case .pending = display {
+                queue.append(request)
+            } else {
+                showPending(request)
+            }
+        } else {
+            // Observer-only tool — don't block Claude, just flash.
+            request.respond(.ask)
+            showObserving(request.event)
+        }
+    }
+
+    // MARK: User clicks Allow / Deny
+
+    func resolve(_ decision: ResponseDecision) {
+        guard case .pending(let current) = display else { return }
+        pendingTimeoutTask?.cancel()
+        current.respond(decision)
+        advanceQueue()
+    }
+
+    // MARK: Private
+
+    private func shouldPrompt(_ event: HookEvent) -> Bool {
+        event.toolName == "Bash"
+    }
+
+    private func showPending(_ request: IncomingRequest) {
+        autoClearTask?.cancel()
+        update(display: .pending(request))
+
+        pendingTimeoutTask?.cancel()
+        pendingTimeoutTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: self.pendingTimeoutDelay)
+            if !Task.isCancelled {
+                // Silence = deny (Variant A, safer default).
+                self.resolve(.deny(reason: "Timed out waiting for ClaudeNotch user decision."))
+            }
+        }
+    }
+
+    private func showObserving(_ event: HookEvent) {
+        pendingTimeoutTask?.cancel()
+        update(display: .observing(event))
+
+        autoClearTask?.cancel()
+        autoClearTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: self.autoClearDelay)
+            if !Task.isCancelled, case .observing = self.display {
+                self.update(display: .idle)
+            }
+        }
+    }
+
+    private func advanceQueue() {
+        if let next = queue.first {
+            queue.removeFirst()
+            showPending(next)
+        } else {
+            update(display: .idle)
+        }
+    }
+
+    private func update(display new: Display) {
+        display = new
+        onDisplayChanged?(new)
     }
 }
 
 // MARK: - SocketServer
 
-/// Listens on a Unix domain socket at `socketPath`. Each incoming connection
-/// is treated as one-shot: read until EOF, parse JSON, hand off to `onEvent`.
-///
-/// Phase 2.1 is fire-and-forget — the server never writes back. Phase 2.2
-/// will add request/response for approve/deny.
 final class SocketServer {
     private let socketPath: String
-    private let onEvent: (HookEvent) -> Void
+    private let onRequest: (IncomingRequest) -> Void
     private var listener: NWListener?
 
-    init(socketPath: String = "/tmp/claude-notch.sock", onEvent: @escaping (HookEvent) -> Void) {
+    init(socketPath: String = "/tmp/claude-notch.sock",
+         onRequest: @escaping (IncomingRequest) -> Void) {
         self.socketPath = socketPath
-        self.onEvent = onEvent
+        self.onRequest = onRequest
     }
 
     func start() {
-        // Remove any stale socket file from a previous run; otherwise bind fails
-        // with "Address already in use".
         try? FileManager.default.removeItem(atPath: socketPath)
 
         do {
@@ -100,7 +211,7 @@ final class SocketServer {
                 case .cancelled:
                     NSLog("[ClaudeNotch] listener cancelled")
                 default:
-                    break  // .setup / .waiting are transient, don't log
+                    break
                 }
             }
 
@@ -111,7 +222,7 @@ final class SocketServer {
             listener.start(queue: .main)
             self.listener = listener
         } catch {
-            NSLog("[ClaudeNotch] socket server failed to start: \(error)")
+            NSLog("[ClaudeNotch] listener start failed: \(error)")
         }
     }
 
@@ -130,8 +241,8 @@ final class SocketServer {
             }
 
             if isComplete || error != nil {
-                self.process(buffer)
-                connection.cancel()
+                self.process(buffer, on: connection)
+                // Don't cancel here — process() or the respond() closure will.
                 return
             }
 
@@ -139,13 +250,31 @@ final class SocketServer {
         }
     }
 
-    private func process(_ data: Data) {
-        guard !data.isEmpty else { return }
+    private func process(_ data: Data, on connection: NWConnection) {
+        guard !data.isEmpty else {
+            connection.cancel()
+            return
+        }
         guard let event = HookEvent.parse(data) else {
             let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
             NSLog("[ClaudeNotch] parse failed; raw=\(raw)")
+            connection.cancel()
             return
         }
-        onEvent(event)
+
+        // Build a respond closure that writes the decision JSON and closes
+        // the connection. Called once — either by NotchState.resolve() or
+        // by the auto-respond path for non-prompting tools.
+        let request = IncomingRequest(event: event) { [weak self] decision in
+            self?.send(decision, on: connection)
+        }
+        onRequest(request)
+    }
+
+    private func send(_ decision: ResponseDecision, on connection: NWConnection) {
+        connection.send(content: decision.hookOutputJSON,
+                        completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 }
