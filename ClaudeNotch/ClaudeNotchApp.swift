@@ -15,20 +15,25 @@ struct ClaudeNotchApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notchWindow: NSWindow?
+    private let state = NotchState()
+    private lazy var socketServer = SocketServer { [weak self] event in
+        Task { @MainActor in self?.state.show(event) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { return }
-        let window = Self.makeNotchWindow(on: screen)
-        window.orderFrontRegardless()
-        notchWindow = window
+        notchWindow = makeNotchWindow(on: screen)
+        notchWindow?.orderFrontRegardless()
+        socketServer.start()
     }
 
     // MARK: - Window construction
 
-    private static func makeNotchWindow(on screen: NSScreen) -> NSPanel {
-        let frame = notchFrame(on: screen)
+    private func makeNotchWindow(on screen: NSScreen) -> NSPanel {
+        let frame = Self.notchFrame(on: screen)
 
         // NSPanel + .nonactivatingPanel: click on the overlay does NOT activate
         // our app, so focus stays on whatever the user was using.
@@ -49,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Visible on every Space and even when another app is fullscreen.
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        panel.contentView = NSHostingView(rootView: NotchView())
+        panel.contentView = NSHostingView(rootView: NotchView(state: state))
         return panel
     }
 
