@@ -1,24 +1,19 @@
-//
-//  ContentView.swift
-//  ClaudeNotch
-//
-//  Created by Ваня on 23.04.2026.
-//
-
 import SwiftUI
 
-struct ContentView: View {
+struct NotchView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        ZStack {
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.red)
+            Text("Hello Notch")
+                .foregroundStyle(.white)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
         }
-        .padding()
     }
 }
 
 #Preview {
-    ContentView()
+    NotchView()
+        .frame(width: 220, height: 32)
+        .background(Color.black)
 }
