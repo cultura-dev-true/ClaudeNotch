@@ -6,28 +6,61 @@ import Observation
 
 // MARK: - HookEvent
 
+/// Parsed PreToolUse payload from the Python bridge. Carries everything the
+/// notch UI needs to render both the compact one-liner and the hover-expanded
+/// detail view.
 struct HookEvent: Equatable {
+    let sessionID: String
+    let transcriptPath: String?
     let toolName: String
+    /// Short one-liner for the compact pill (e.g. file basename, first words
+    /// of a Bash command).
     let summary: String?
+    /// Full text shown in the hover-expanded detail view (full command,
+    /// absolute file path, etc.). Falls back to `summary` when missing.
+    let detail: String?
 
     static func parse(_ data: Data) -> HookEvent? {
         guard
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let toolName = object["tool_name"] as? String
+            let toolName = object["tool_name"] as? String,
+            let sessionID = object["session_id"] as? String
         else {
             return nil
         }
 
+        let transcriptPath = object["transcript_path"] as? String
         let input = object["tool_input"] as? [String: Any]
-        let summary: String? = {
+
+        let detail: String? = {
             if let command = input?["command"] as? String { return command }
+            if let filePath = input?["file_path"] as? String { return filePath }
+            return nil
+        }()
+        let summary: String? = {
+            if let command = input?["command"] as? String {
+                return Self.firstLine(command)
+            }
             if let filePath = input?["file_path"] as? String {
                 return (filePath as NSString).lastPathComponent
             }
             return nil
         }()
 
-        return HookEvent(toolName: toolName, summary: summary)
+        return HookEvent(
+            sessionID: sessionID,
+            transcriptPath: transcriptPath,
+            toolName: toolName,
+            summary: summary,
+            detail: detail
+        )
+    }
+
+    private static func firstLine(_ raw: String) -> String {
+        let line = raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? raw
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.count <= 60 { return trimmed }
+        return String(trimmed.prefix(59)) + "…"
     }
 }
 
@@ -354,6 +387,16 @@ final class NotchState {
     private(set) var isHovering: Bool = false
     private(set) var recentSessions: [SessionInfo] = []
 
+    /// Physical notch height of the active screen, in points. Set once at
+    /// launch from `NSScreen.safeAreaInsets.top`. Drives the resting pill
+    /// height so the visible black shape matches the hardware cutout.
+    var notchHeight: CGFloat = 32
+
+    /// Physical notch width — the gap between the left/right menu-bar
+    /// auxiliary areas. Resting pill uses this width exactly so it fuses with
+    /// the hardware cutout instead of overhanging it.
+    var notchWidth: CGFloat = 190
+
     // MARK: Callbacks
 
     /// Fired whenever the computed panel size changes. AppDelegate subscribes
@@ -367,21 +410,32 @@ final class NotchState {
     private var pendingTimeoutTask: Task<Void, Never>?
     private var hoverCollapseTask: Task<Void, Never>?
 
-    private let autoClearDelay: Duration = .seconds(3)
+    private let autoClearDelay: Duration = .seconds(6)
     private let pendingTimeoutDelay: Duration = .seconds(30)
     private let hoverCollapseDelay: Duration = .milliseconds(150)
 
     // MARK: Derived size
 
     /// Current size the panel should have based on display + hover state.
-    /// Idle/observing uses a slightly oversized frame so hover tracking picks
-    /// up mouse movement over the full physical-notch area, not just the
-    /// narrow visible pill.
+    /// Heights are layered on top of `notchHeight` so the pill always starts
+    /// at the physical notch and grows downward.
+    ///
+    /// Idle and observing reserve transparent slack around the visible pill so
+    /// hover events fire reliably even when the cursor isn't pixel-perfect on
+    /// the notch.
     var panelSize: CGSize {
-        if shouldExpand { return CGSize(width: 320, height: 200) }
+        let notch = notchHeight
+        if shouldExpand { return CGSize(width: 380, height: notch + 220) }
         switch display {
-        case .pending: return CGSize(width: 280, height: 76)
-        default:       return CGSize(width: 320, height: 44)
+        case .pending:
+            return CGSize(width: 340, height: notch + 64)
+        case .observing:
+            // Wider + a bit taller than the notch — the pill grows past the
+            // hardware cutout so the activity text is actually visible.
+            return CGSize(width: max(notchWidth + 140, 320), height: notch + 18)
+        case .idle:
+            // Same shape as the notch + a transparent hover-catch buffer.
+            return CGSize(width: notchWidth + 60, height: notch + 10)
         }
     }
 
@@ -416,13 +470,15 @@ final class NotchState {
         advanceQueue()
     }
 
-    /// Called from the view on every mouse enter/exit. Enter applies immediately
-    /// so the pill expands without lag; exit is debounced by
-    /// `hoverCollapseDelay` so micro-movements at the pill's edge don't cause
-    /// a flicker loop of expand/collapse.
+    /// Called only on real hover transitions (the AppDelegate dedupes
+    /// non-changes via its own `lastReportedInside`). Enter applies
+    /// immediately; exit is debounced by `hoverCollapseDelay` so a quick
+    /// flick of the cursor through the pill edge doesn't strand the panel
+    /// in the wrong state.
     func setHovering(_ new: Bool) {
         if new {
             hoverCollapseTask?.cancel()
+            hoverCollapseTask = nil
             guard !isHovering else { return }
             isHovering = true
             recentSessions = SessionStore.recentSessions(limit: 3)
@@ -430,13 +486,15 @@ final class NotchState {
             return
         }
 
-        // Exiting — schedule a delayed collapse. If the mouse re-enters
-        // before it fires, we cancel and stay expanded.
-        hoverCollapseTask?.cancel()
+        // Exiting — schedule a delayed collapse. If a collapse task is already
+        // pending, leave it alone; restarting would let the timer reset
+        // forever as the mouse keeps moving outside the panel.
+        if hoverCollapseTask != nil { return }
         hoverCollapseTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: self.hoverCollapseDelay)
-            if !Task.isCancelled, self.isHovering {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, !Task.isCancelled else { return }
+            self.hoverCollapseTask = nil
+            if self.isHovering {
                 self.isHovering = false
                 self.emitSizeUpdate()
             }

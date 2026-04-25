@@ -3,72 +3,95 @@ import SwiftUI
 struct NotchView: View {
     let state: NotchState
 
-    // Size of the visible black pill in idle/observing state. The panel frame
-    // is intentionally larger (see NotchState.panelSize) so the extra area
-    // catches hover events over the physical notch.
-    private let compactPillWidth: CGFloat = 220
-    private let compactPillHeight: CGFloat = 32
+    /// Bottom-only corner radius — the pill's top edge meets the screen edge
+    /// so only the bottom corners need rounding. Tuned to look concentric
+    /// with the hardware notch (~9pt outer / ~5pt inner radius).
+    private let pillCornerRadius: CGFloat = 12
 
     var body: some View {
+        // Hover events arrive from the AppKit-level HoverTrackingView wrapping
+        // this hosting view (see ClaudeNotchApp.swift) — SwiftUI .onHover only
+        // fires for the front-most app, which we never are.
         base
-            .onHover { hovering in state.setHovering(hovering) }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .ignoresSafeArea()
     }
 
     @ViewBuilder
     private var base: some View {
         if state.shouldExpand {
-            fullPill { ExpandedView(
+            expandedPill { ExpandedView(
                 sessions: state.recentSessions,
                 onPick: { _ in ClaudeDesktopLauncher.activate() }
             )}
         } else {
             switch state.display {
             case .pending(let request):
-                fullPill { pendingContent(for: request) }
+                expandedPill { pendingContent(for: request) }
 
             case .observing(let event):
-                compactPill { eventLabel(for: event) }
+                activityPill { eventLabel(for: event) }
 
             case .idle:
-                compactPill {
-                    Text("idle")
-                        .foregroundStyle(.white.opacity(0.25))
-                        .font(.system(size: 9, weight: .regular, design: .rounded))
-                }
+                idlePill
             }
         }
     }
 
     // MARK: Pill shells
 
-    /// Fills the entire panel — used for pending approval and expanded session
-    /// list, where we want the visible pill to match panel bounds.
-    private func fullPill<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 14)
+    /// The expanded pill grows downward from the notch. Top corners stay sharp
+    /// (they meet the screen edge), bottom corners are rounded.
+    private func expandedPill<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ZStack(alignment: .top) {
+            BottomRoundedRectangle(cornerRadius: pillCornerRadius * 2)
                 .fill(Color.black)
             content()
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
+                .padding(.top, state.notchHeight + 6)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 10)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    /// Renders the small pill (compactPillWidth × compactPillHeight) centered
-    /// at the top of a transparent hover-catcher frame. The transparent margin
-    /// ensures hover fires for the full notch area, not just on the pill.
-    private func compactPill<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    /// Resting pill — exactly the size of the hardware notch so it fuses with
+    /// the cutout. The surrounding panel area is transparent and stays
+    /// hover-active so the cursor doesn't have to land pixel-perfectly on the
+    /// black pill to expand the notch.
+    private var idlePill: some View {
         ZStack(alignment: .top) {
             Color.clear
                 .contentShape(Rectangle())
-            ZStack {
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(Color.black)
-                content()
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 2)
-            }
-            .frame(width: compactPillWidth, height: compactPillHeight)
+            BottomRoundedRectangle(cornerRadius: pillCornerRadius)
+                .fill(Color.black)
+                .frame(width: state.notchWidth, height: state.notchHeight)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    /// Activity pill — the black shape grows past the bottom of the hardware
+    /// notch by ~`notchHeight` overshoot, with the activity text sitting in
+    /// that overshoot. This is the visible signal "Claude is doing something".
+    private func activityPill<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ZStack(alignment: .top) {
+            Color.clear
+                .contentShape(Rectangle())
+            BottomRoundedRectangle(cornerRadius: pillCornerRadius)
+                .fill(Color.black)
+                .overlay(alignment: .top) {
+                    content()
+                        .padding(.top, state.notchHeight + 1)
+                        .padding(.horizontal, 14)
+                }
+                .frame(
+                    minWidth: state.notchWidth,
+                    maxWidth: .infinity,
+                    minHeight: state.notchHeight + 16,
+                    maxHeight: state.notchHeight + 16
+                )
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     // MARK: Content builders
@@ -171,6 +194,40 @@ struct SessionRow: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.white.opacity(0.05))
         )
+    }
+}
+
+// MARK: - BottomRoundedRectangle
+
+/// Rectangle with only its bottom-left and bottom-right corners rounded.
+/// The pill's top edge sits flush with the screen bezel, so rounding the
+/// top would create a visible gap above the notch.
+struct BottomRoundedRectangle: Shape {
+    var cornerRadius: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let r = min(cornerRadius, min(rect.width, rect.height) / 2)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
+        path.addArc(
+            center: CGPoint(x: rect.maxX - r, y: rect.maxY - r),
+            radius: r,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+        path.addLine(to: CGPoint(x: rect.minX + r, y: rect.maxY))
+        path.addArc(
+            center: CGPoint(x: rect.minX + r, y: rect.maxY - r),
+            radius: r,
+            startAngle: .degrees(90),
+            endAngle: .degrees(180),
+            clockwise: false
+        )
+        path.closeSubpath()
+        return path
     }
 }
 
