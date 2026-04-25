@@ -13,12 +13,6 @@ struct ClaudeNotchApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    // MARK: Sizes
-
-    private let idlePillWidth: CGFloat = 220
-    private let pendingPillWidth: CGFloat = 280
-    private let extraHeightForButtons: CGFloat = 44
-
     // MARK: Properties
 
     private var notchPanel: NSPanel?
@@ -31,11 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { return }
-        notchPanel = makeNotchPanel(on: screen)
+        notchPanel = makeNotchPanel(on: screen, size: state.panelSize)
         notchPanel?.orderFrontRegardless()
 
-        state.onDisplayChanged = { [weak self] display in
-            self?.resize(for: display)
+        state.onPanelSizeNeedsUpdate = { [weak self] size in
+            self?.resizePanel(to: size)
         }
 
         socketServer.start()
@@ -43,9 +37,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Panel
 
-    private func makeNotchPanel(on screen: NSScreen) -> NSPanel {
+    private func makeNotchPanel(on screen: NSScreen, size: CGSize) -> NSPanel {
         let panel = NSPanel(
-            contentRect: frame(for: .idle, on: screen),
+            contentRect: frame(for: size, on: screen),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -63,28 +57,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return panel
     }
 
-    /// Rect at top-center, sized according to the current display state.
-    /// Notch height comes from `safeAreaInsets.top` (32pt fallback for
-    /// non-notched screens). Pending adds 44pt below for the button row.
-    private func frame(for display: NotchState.Display, on screen: NSScreen) -> NSRect {
-        let notchHeight = max(screen.safeAreaInsets.top, 32)
-        let width: CGFloat
-        let height: CGFloat
-        switch display {
-        case .pending:
-            width = pendingPillWidth
-            height = notchHeight + extraHeightForButtons
-        default:
-            width = idlePillWidth
-            height = notchHeight
-        }
-        let x = screen.frame.midX - width / 2
-        let y = screen.frame.maxY - height  // NSScreen uses bottom-left origin; maxY is top
-        return NSRect(x: x, y: y, width: width, height: height)
+    /// Rect at top-center of the screen for the given size. Snaps y such that
+    /// the top of the panel touches the top of the screen (covers the notch
+    /// on MacBooks that have one).
+    private func frame(for size: CGSize, on screen: NSScreen) -> NSRect {
+        let x = screen.frame.midX - size.width / 2
+        let y = screen.frame.maxY - size.height
+        return NSRect(origin: CGPoint(x: x, y: y), size: size)
     }
 
-    private func resize(for display: NotchState.Display) {
+    private func resizePanel(to size: CGSize) {
         guard let panel = notchPanel, let screen = NSScreen.main else { return }
-        panel.setFrame(frame(for: display, on: screen), display: true, animate: true)
+        panel.setFrame(frame(for: size, on: screen), display: true, animate: true)
     }
 }
